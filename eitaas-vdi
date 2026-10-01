@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""Connect to the Air Force EITaaS VDI (Azure Virtual Desktop, US Government) from Omarchy.
+
+The session runs in the distribution's sdl-freerdp3 (native Wayland) with the CAC redirected
+into Windows over PC/SC. FreeRDP's Entra ID sign-in is handed to a dedicated Chrome profile,
+which already does CAC client-certificate auth through the OpenSC module in ~/.pki/nssdb;
+the OAuth redirect is captured over Chrome's private DevTools pipe and fed back to FreeRDP.
+
+  eitaas-vdi [connect]      connect with the imported profile
+  eitaas-vdi setup [FILE]   import a .rdpw profile (without FILE: download it via the web client)
+  eitaas-vdi doctor         check the smart-card stack, reader, card, and profile
+                            (--dialog shows the result in a popup)
+  eitaas-vdi signout        forget the sign-in browser's cookies
+"""
+
+import concurrent.futures
+import fcntl
+import hashlib
+import html
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+APP = "eitaas-vdi"
+TITLE = "EITaaS VDI"
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP
+PROFILE = CONFIG_DIR / "profile.rdpw"
+EXTRA_ARGS = CONFIG_DIR / "freerdp-args"
+BROWSER_PROFILE = DATA_DIR / "signin-browser"
+LOG = STATE_DIR / "last.log"
+
+FREERDP = os.environ.get("EITAAS_VDI_FREERDP", "sdl-freerdp3")
+# Any Chromium-based browser that reads the shared NSS database (~/.pki/nssdb) for the CAC.
+# Flatpak and Snap browsers do not, so use a native package.
+CHROME = os.environ.get("EITAAS_VDI_BROWSER") or next(
+    (b for b in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser") if shutil.which(b)),
+    "google-chrome-stable",
+)
+MIN_FREERDP = (3, 16, 0)  # first release with configurable AVD scope/redirect (Azure Government)
+WEB_CLIENT = "https://rdweb.wvd.azure.us/arm/webclient"
+
+# Azure US Government AVD sign-in. FreeRDP defaults to the commercial cloud; these are the
+# public values hardware-validated by the EITaaS-Linux project (github.com/sjtrotter/EITaaS-Linux).
+AUTHORITY = "login.microsoftonline.us"
+SCOPE = "https%3A%2F%2Fwww.wvd.azure.us%2F.default%20openid%20profile%20offline_access"
+REDIRECT = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+# FreeRDP formats this with winpr_asprintf(), hence the doubled percent signs.
+REDIRECT_FORMAT = "https%%3A%%2F%%2Flogin.microsoftonline.com%%2Fcommon%%2Foauth2%%2Fnativeclient"
+
+# FreeRDP 3.30+ rejects wildcard names (*.wvd.azure.us) when matching a certificate to its host,
+# so every AVD gateway certificate looks like a name mismatch. Instead of prompting, the
+# certificates these endpoints serve are verified here (system CAs + proper hostname check) and
+# pinned by fingerprint. A pinned fingerprint is only presentable by the holder of its key.
+GATEWAY_HOSTS = (
+    "rdweb.wvd.azure.us",
+    "rdbroker.wvd.azure.us",
+    "rdgateway.wvd.azure.us",
+    "rdgateway-r0.wvd.azure.us",
+    "rdgateway-r1.wvd.azure.us",
+    "client.wvd.azure.us",
+)
+
+SIGNIN_TIMEOUT = 300
+SETUP_TIMEOUT = 900
+
+
+# ---------------------------------------------------------------- feedback
+
+
+def notify(body, urgency="normal"):
+    subprocess.run(
+        ["notify-send", "-a", TITLE, "-u", urgency, "-i", "network-workgroup", TITLE, body],
+        check=False,
+    )
+
+
+def interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def info(message):
+    print(message) if interactive() else notify(message)
+
+
+def dialog(kind, text, title=TITLE, ok=None, cancel=None, markup=False):
+    """A zenity popup; returns True when the user confirms. Falls back to a notification."""
+    if not shutil.which("zenity"):
+        notify(re.sub(r"<[^>]+>", "", text) if markup else text, "critical" if kind == "error" else "normal")
+        return False
+    command = ["zenity", f"--{kind}", f"--title={title}", "--width=560", f"--text={text}"]
+    if not markup:
+        command.append("--no-markup")
+    if ok:
+        command.append(f"--ok-label={ok}")
+    if cancel:
+        command.append(f"--cancel-label={cancel}")
+    return subprocess.run(command, check=False).returncode == 0
+
+
+def fail(message):
+    if interactive():
+        print(f"error: {message}", file=sys.stderr)
+    else:
+        dialog("error", message)
+    sys.exit(1)
+
+
+SECRET = re.compile(r"(?i)((?:code|access_token|refresh_token|id_token|client_info|session_state)=)[^&\s]+")
+
+
+# FreeRDP logs the Windows logon (domain\\user, and the CAC's 10-digit DoD ID) at session start.
+IDENTITY = re.compile(r"(Logon Info V\d \[)[^\]]*|\b\d{10}[A-Z]?\b")
+
+
+def redact(line):
+    line = SECRET.sub(r"\1<redacted>", line)
+    return IDENTITY.sub(lambda m: (m.group(1) or "") + "<redacted>", line)
+
+
+def private_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+# ---------------------------------------------------------------- checks
+
+
+def card_status():
+    """(state, detail): state is ok, no-pcscd, no-reader, no-card, or unknown."""
+    active = subprocess.run(
+        ["systemctl", "is-active", "--quiet", "pcscd.socket"], check=False
+    ).returncode == 0
+    if not active and subprocess.run(["pgrep", "-x", "pcscd"], capture_output=True).returncode:
+        return "no-pcscd", "the PC/SC service is not running (sudo systemctl enable --now pcscd.socket)"
+    if not shutil.which("opensc-tool"):
+        return "unknown", "opensc-tool not found; cannot check the reader"
+    out = subprocess.run(["opensc-tool", "-l"], capture_output=True, text=True, check=False)
+    text = out.stdout + out.stderr
+    if "No smart card readers" in text:
+        return "no-reader", "no smart card reader found; plug in your CAC reader"
+    rows = [line for line in text.splitlines() if re.match(r"\s*\d+\s", line)]
+    if rows and not any(re.match(r"\s*\d+\s+Yes\b", line) for line in rows):
+        return "no-card", "the reader is empty; insert your CAC"
+    return "ok", "CAC reader and card present"
+
+
+def doctor(popup=False):
+    checks = []
+    for binary, package in ((FREERDP, "FreeRDP 3 SDL client"), (CHROME, "Google Chrome or Chromium"),
+                            ("opensc-tool", "OpenSC"), ("modutil", "NSS tools"), ("zenity", "zenity")):
+        found = shutil.which(binary)
+        checks.append((bool(found), f"{binary}: {'found' if found else f'missing (install {package})'}"))
+    if shutil.which(FREERDP):
+        build = subprocess.run([FREERDP, "/buildconfig"], capture_output=True, text=True, check=False).stdout
+        for flag in ("WITH_AAD", "WITH_PCSC"):
+            on = f"{flag}=ON" in build
+            checks.append((on, f"FreeRDP {flag}: {'on' if on else 'off'}"))
+    nssdb = subprocess.run(
+        ["modutil", "-dbdir", f"sql:{Path.home()}/.pki/nssdb", "-list"], capture_output=True, text=True, check=False
+    ).stdout if shutil.which("modutil") else ""
+    has_module = "opensc-pkcs11" in nssdb or "p11-kit-proxy" in nssdb
+    checks.append((has_module, "Browser CAC module: " + ("registered in ~/.pki/nssdb" if has_module else
+                   "not registered in ~/.pki/nssdb (see the SOP, “Set up your CAC in the browser”)")))
+    state, detail = card_status()
+    checks.append((state == "ok", f"Smart card: {detail}"))
+    checks.append((PROFILE.is_file(), "Profile: " + ("imported" if PROFILE.is_file() else f"missing (run: {APP} setup)")))
+    if shutil.which(FREERDP):
+        version = subprocess.run([FREERDP, "/version"], capture_output=True, text=True, check=False).stdout
+        match = re.search(r"version \S*\s*(\d+)\.(\d+)\.(\d+)", version)
+        found = tuple(int(x) for x in match.groups()) if match else None
+        ok = bool(found) and found >= MIN_FREERDP
+        label = ".".join(map(str, found)) if found else "unknown"
+        checks.append((ok, f"FreeRDP version: {label} (needs 3.16 or newer; tested with 3.31.1)"))
+    report = "\n".join(f"{'✓' if ok else '✗'}  {line}" for ok, line in checks)
+    healthy = all(ok for ok, _ in checks)
+    if popup:
+        summary = "Everything needed to connect is in place." if healthy else "Fix the items marked ✗, then check again."
+        dialog("info" if healthy else "warning", f"{report}\n\n{summary}", title=f"{TITLE} check")
+    else:
+        print("\n".join("  " + line for line in report.splitlines()))
+    return healthy
+
+
+# ---------------------------------------------------------------- sign-in browser
+
+
+class Browser:
+    """A dedicated Chrome instance driven over --remote-debugging-pipe (fd 3 in, fd 4 out).
+
+    The pipe is private to this process, unlike a TCP debugging port. The separate profile keeps
+    Microsoft's sign-in cookies, so the second token FreeRDP requests completes without input.
+    """
+
+    def __init__(self, url, app=True):
+        private_dir(BROWSER_PROFILE)
+        cmd_r, self.cmd_w = os.pipe()
+        self.evt_r, evt_w = os.pipe()
+        args = [
+            CHROME,
+            f"--user-data-dir={BROWSER_PROFILE}",
+            "--remote-debugging-pipe",
+            "--no-first-run",
+            "--no-default-browser-check",
+            f"--app={url}" if app else url,
+        ]
+        self.proc = subprocess.Popen(
+            ["bash", "-c", 'exec 3<&"$1" 4>&"$2"; shift 2; exec "$@"', "_", str(cmd_r), str(evt_w), *args],
+            pass_fds=(cmd_r, evt_w),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.close(cmd_r)
+        os.close(evt_w)
+        self.buffer = b""
+        self.next_id = 1
+        self.send("Target.setDiscoverTargets", {"discover": True})
+
+    def send(self, method, params=None):
+        message = {"id": self.next_id, "method": method, "params": params or {}}
+        self.next_id += 1
+        try:
+            os.write(self.cmd_w, json.dumps(message).encode() + b"\0")
+        except OSError:
+            pass
+
+    def urls(self, timeout):
+        """Yield page URLs as Chrome navigates; returns when Chrome exits or the timeout passes."""
+        deadline = time.monotonic() + timeout
+        while (remaining := deadline - time.monotonic()) > 0:
+            ready, _, _ = select.select([self.evt_r], [], [], min(remaining, 1.0))
+            if not ready:
+                continue
+            chunk = os.read(self.evt_r, 65536)
+            if not chunk:
+                return
+            self.buffer += chunk
+            *messages, self.buffer = self.buffer.split(b"\0")
+            for raw in messages:
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                target = event.get("params", {}).get("targetInfo", {})
+                if event.get("method") in ("Target.targetCreated", "Target.targetInfoChanged") \
+                        and target.get("type") == "page" and target.get("url"):
+                    yield target["url"]
+
+    def close(self):
+        self.send("Browser.close")
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        for fd in (self.cmd_w, self.evt_r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def is_redirect(url):
+    parts = urllib.parse.urlsplit(url)
+    expected = urllib.parse.urlsplit(REDIRECT)
+    if (parts.scheme, parts.netloc, parts.path) != (expected.scheme, expected.netloc, expected.path):
+        return False
+    query = urllib.parse.parse_qs(parts.query)
+    return "code" in query or "error" in query
+
+
+def browser_sign_in(auth_url):
+    """Open the authorization URL in the sign-in browser and return the redirect URL, or None."""
+    browser = Browser(auth_url)
+    try:
+        for url in browser.urls(SIGNIN_TIMEOUT):
+            if is_redirect(url):
+                return url
+        return None
+    finally:
+        browser.close()
+
+
+# ---------------------------------------------------------------- gateway certificates
+
+
+def profile_text(path):
+    raw = path.read_bytes()
+    return raw.decode("utf-16") if b"\x00" in raw else raw.decode("utf-8-sig", errors="replace")
+
+
+def profile_gateway(text):
+    match = re.search(r"(?im)^gatewayhostname:s:\s*([^\s:/]+)", text)
+    return match.group(1).lower() if match else None
+
+
+def verified_fingerprint(host):
+    """SHA-256 of the certificate host serves, only if it verifies against the system CAs."""
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, 443), timeout=8) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as tls:
+                return hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
+    except (OSError, ssl.SSLError):
+        return None
+
+
+def pinned_certificates():
+    hosts = set(GATEWAY_HOSTS)
+    gateway = profile_gateway(profile_text(PROFILE))
+    if gateway and gateway.endswith(".wvd.azure.us"):
+        hosts.add(gateway)
+    with concurrent.futures.ThreadPoolExecutor(len(hosts)) as pool:
+        fingerprints = sorted({fp for fp in pool.map(verified_fingerprint, sorted(hosts)) if fp})
+    return ",".join(f"fingerprint:sha256:{fp}" for fp in fingerprints)
+
+
+# ---------------------------------------------------------------- setup
+
+
+def import_profile(source, announce=True):
+    source = Path(source).expanduser()
+    if source.is_symlink() or not source.is_file():
+        fail(f"{source} is not a regular file")
+    if source.suffix.lower() != ".rdpw":
+        fail("expected the .rdpw file downloaded from the AVD web client")
+    if source.stat().st_size > 1024 * 1024:
+        fail(f"{source} is too large to be an RDP profile")
+    raw = source.read_bytes()
+    text = profile_text(source)
+    if not re.search(r"(?im)^resourceprovider:s:arm\s*$", text):
+        fail("that profile is not an Azure Virtual Desktop (ARM) profile")
+    if not (profile_gateway(text) or "").endswith(".wvd.azure.us"):
+        fail("that profile's gateway is not in the Azure US Government cloud (*.wvd.azure.us)")
+    private_dir(CONFIG_DIR)
+    temporary = PROFILE.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+    temporary.replace(PROFILE)
+    source.unlink()
+    if announce:
+        info(f"Profile imported. Launch “{TITLE}” to connect.")
+
+
+SETUP_STEPS = (
+    "1. Sign in with your CAC (pick the PIV Authentication certificate, enter your PIN).\n"
+    "2. Click the settings cog (top right) → “Download the rdp file”.\n"
+    "3. Click your desktop. The .rdpw file is imported automatically and the browser closes."
+)
+
+
+def setup(argv, first_run=False):
+    """Import a profile; returns True once one is in place."""
+    if argv:
+        import_profile(argv[0])
+        return True
+    downloads = Path(
+        subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True, text=True).stdout.strip()
+        or Path.home() / "Downloads"
+    )
+    started = time.time()
+    if first_run:
+        welcome = (
+            f"<b>Welcome to {TITLE}</b>\n\n"
+            "Before the first connection, this computer needs your workspace profile "
+            "(a small .rdpw file) from the Azure Virtual Desktop web client.\n\n"
+            "<b>Plug in your CAC reader first.</b> Then choose “Open web client”:\n\n"
+            + html.escape(SETUP_STEPS)
+            + "\n\nYou only need to do this once. The connection starts right after."
+        )
+        if not dialog("question", welcome, ok="Open web client", cancel="Not now", markup=True):
+            return False
+    elif interactive():
+        print("A browser window will open the AVD web client.\n\n" + SETUP_STEPS)
+    else:
+        dialog("info", "A browser window will open the AVD web client.\n\n" + SETUP_STEPS, title=f"{TITLE} setup")
+    browser = Browser(WEB_CLIENT, app=False)
+    found = None
+    try:
+        deadline = time.monotonic() + SETUP_TIMEOUT
+        while time.monotonic() < deadline and browser.proc.poll() is None:
+            candidates = [
+                p for p in downloads.glob("*.rdpw")
+                if p.stat().st_mtime >= started - 1 and p.stat().st_size > 0
+            ]
+            if candidates:
+                time.sleep(0.5)  # let Chrome finish its rename
+                found = max(candidates, key=lambda p: p.stat().st_mtime)
+                break
+            time.sleep(1)
+    finally:
+        browser.close()
+    if not found:
+        fail("No .rdpw file was downloaded, so nothing was imported.\n\n"
+             f"Launch {TITLE} again to retry, or import a file you already have with:\n"
+             "eitaas-vdi setup FILE.rdpw")
+    import_profile(found, announce=not first_run)
+    return True
+
+
+# ---------------------------------------------------------------- connect
+
+
+def extra_args():
+    if not EXTRA_ARGS.is_file():
+        return []
+    return [line.strip() for line in EXTRA_ARGS.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def runtime_profile():
+    """A private copy of the profile for this session, adjusted for FreeRDP.
+
+    Profiles from the AVD web client set both "smart sizing" and "dynamic resolution". The
+    Windows client lets dynamic resolution win; FreeRDP refuses /dynamic-resolution while
+    smart sizing is on, so smart sizing is switched off in the copy.
+
+    They also set "use multimon" with "singlemoninwindowedmode". FreeRDP ignores the latter and
+    lays out a windowed session as multi-monitor with placeholder 64x64 monitors, which fails
+    its pre-connect check, so the windowed single-monitor rule is applied here. Putting /f or
+    /multimon in freerdp-args keeps the profile's multi-monitor setting.
+    """
+    raw = PROFILE.read_bytes()
+    utf16 = b"\x00" in raw
+    text = profile_text(PROFILE)
+    text = re.sub(r"(?im)^(smart sizing:i:)\d+", r"\g<1>0", text)
+    extra = extra_args()
+    wants_multimon = any(a == "/f" or a.startswith(("/multimon", "+multimon")) for a in extra)
+    windowed = not re.search(r"(?im)^screen mode id:i:2\b", text)
+    if windowed and not wants_multimon and re.search(r"(?im)^singlemoninwindowedmode:i:1\b", text):
+        text = re.sub(r"(?im)^(use multimon:i:)\d+", r"\g<1>0", text)
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR)
+    path = private_dir(runtime / APP) / "session.rdpw"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(text.encode("utf-16") if utf16 else text.encode())
+    return path
+
+
+def freerdp_command(profile, pins=""):
+    command = [
+        FREERDP,
+        str(profile),
+        "/gateway:type:arm",
+        "/sec:aad",
+        f"/azure:ad:{AUTHORITY},use-tenantid:on,avd-access:{REDIRECT_FORMAT},avd-scope:{SCOPE}",
+        "/smartcard",
+        # The ARM gateway can hold the connection request while it starts the session host.
+        "/timeout:60000",
+        "/dynamic-resolution",
+        "+clipboard",
+        "/sound",
+        "/microphone",
+        f"/t:{TITLE}",
+        # Only to see when the session accepts resizes; see nudge_window().
+        "/log-filters:com.freerdp.client.sdl.disp:DEBUG",
+    ]
+    if pins:
+        command.append(f"/cert:{pins}")
+    return command + extra_args()
+
+
+# FreeRDP complains that stdin is not a terminal; harmless, since the redirect arrives on a pipe.
+NOISE = re.compile(r"com\.freerdp\.utils\.passphrase|cliprdr\.file")
+
+
+def error_summary(errors):
+    for line in reversed(errors):
+        if match := re.search(r"(AADSTS\d+:[^.\"]*)", line):
+            return match.group(1)
+    for line in reversed(errors):
+        if match := re.search(r"\b(ERRCONNECT_[A-Z_]+|ERRINFO_[A-Z_]+)", line):
+            return match.group(1)
+    return re.sub(r"^.*?\] - \[[^]]*\]:\s*", "", errors[-1])[:300] if errors else "unknown error"
+
+
+def hypr_window(pid):
+    """The Hyprland client for pid, or None outside Hyprland."""
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return None
+    out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, check=False).stdout
+    try:
+        return next((c for c in json.loads(out) if c.get("pid") == pid), None)
+    except ValueError:
+        return None
+
+
+def nudge_window(pid):
+    """Make FreeRDP send the window's real size once the session accepts resizes.
+
+    FreeRDP opens its window at 1024x768 and Hyprland tiles it straight away, long before the
+    display-control channel is up. When the channel arrives FreeRDP only marks the window
+    resizable and never sends the size it already has, so the desktop stays 1024x768 in a big
+    window. Floating and re-tiling the window produces real resize events, which it does send.
+    """
+    time.sleep(1.0)
+    window = hypr_window(pid)
+    if not window or window.get("floating") or window.get("fullscreen"):
+        return
+    toggle = f'hl.dsp.window.float({{ action = "toggle", window = "address:{window["address"]}" }})'
+    subprocess.run(["hyprctl", "dispatch", toggle], capture_output=True, check=False)
+    time.sleep(0.7)  # FreeRDP sends at most one layout per 500 ms
+    subprocess.run(["hyprctl", "dispatch", toggle], capture_output=True, check=False)
+
+
+def valid_auth_url(url):
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme == "https" and parts.hostname == AUTHORITY and not parts.username
+
+
+def connect():
+    if not PROFILE.is_file():
+        if interactive():
+            fail(f"No profile imported yet. Run “{APP} setup” first.")
+        if not setup([], first_run=True):
+            return
+    for binary in (FREERDP, CHROME):
+        if not shutil.which(binary):
+            fail(f"{binary} is not installed; run “{APP} doctor”.")
+    state, detail = card_status()
+    if state in ("no-pcscd", "no-reader", "no-card"):
+        fail(detail[0].upper() + detail[1:] + ".")
+
+    private_dir(STATE_DIR)
+    lock = open(STATE_DIR / "lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("A connection is already starting or running.")
+
+    # FreeRDP's sign-in prompt is printf() without fflush(); a pty keeps stdout line-buffered.
+    # stdin stays a pipe so the long redirect URL is not bounded by the tty line limit.
+    session_profile = runtime_profile()
+    command = freerdp_command(session_profile, pinned_certificates())
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=slave, stderr=slave)
+    os.close(slave)
+    log_fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    log = os.fdopen(log_fd, "w")
+    log.write(f"# {time.strftime('%F %T')} {redact(' '.join(command))}\n")
+    tail = []
+    cancelled = False
+    user_disconnect = False
+    notify("Connecting… sign in with your CAC if the browser asks.")
+
+    buffer = b""
+    while True:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:  # EIO once FreeRDP exits
+            break
+        if not chunk:
+            break
+        buffer += chunk
+        *lines, buffer = buffer.split(b"\n")
+        for raw in lines:
+            line = raw.decode(errors="replace").rstrip("\r")
+            if line.startswith("Browse to: "):
+                auth_url = line[len("Browse to: "):].strip()
+                log.write("Browse to: <authorization request>\n")
+                if not valid_auth_url(auth_url):
+                    log.write("refused: authorization URL is not on the expected authority\n")
+                    cancelled = True
+                    proc.terminate()
+                    continue
+                redirect = browser_sign_in(auth_url)
+                if not redirect or "code=" not in redirect:
+                    log.write("sign-in cancelled or failed in the browser\n")
+                    cancelled = True
+                    proc.terminate()
+                    continue
+                try:
+                    proc.stdin.write(redirect.encode() + b"\n")
+                    proc.stdin.flush()
+                    log.write("redirect returned to FreeRDP\n")
+                except BrokenPipeError:
+                    log.write("FreeRDP exited during sign-in\n")
+            elif line.startswith("Paste redirect URL here"):
+                continue
+            elif "pressed, disconnecting RDP session" in line:
+                # The disconnect hotkey (Right Shift+D); FreeRDP then exits 131 like a failure.
+                user_disconnect = True
+                log.write(redact(line) + "\n")
+            elif "DisplayControlCapsPdu: setting the window as resizable" in line:
+                log.write("display control ready; resizing to the window\n")
+                threading.Thread(target=nudge_window, args=(proc.pid,), daemon=True).start()
+            else:
+                clean = redact(line)
+                log.write(clean + "\n")
+                if "[ERROR]" in clean and not NOISE.search(clean):
+                    tail = (tail + [clean])[-10:]
+        log.flush()
+    code = proc.wait()
+    os.close(master)
+    session_profile.unlink(missing_ok=True)
+    log.write(f"# exit {code}\n")
+    log.close()
+    if cancelled:
+        notify(f"Sign-in was cancelled or did not finish. Log: {LOG}", "critical")
+    elif not user_disconnect and code not in (0, 1, 2, 11, 145):  # success, disconnect, logoff, by user, cancelled
+        notify(f"Connection ended with an error (code {code}):\n{error_summary(tail)}\nLog: {LOG}", "critical")
+
+
+def signout():
+    if BROWSER_PROFILE.exists():
+        shutil.rmtree(BROWSER_PROFILE)
+    info("Signed out: the sign-in browser profile was removed.")
+
+
+def main():
+    argv = sys.argv[1:]
+    command = argv[0] if argv else "connect"
+    if command == "connect":
+        connect()
+    elif command == "setup":
+        setup(argv[1:])
+    elif command == "doctor":
+        ok = doctor(popup="--dialog" in argv)
+        if "--wait" in argv:
+            input("\nPress Enter to close")
+        sys.exit(0 if ok else 1)
+    elif command == "signout":
+        signout()
+    elif command in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    else:
+        fail(f"unknown command {command!r}; see {APP} --help")
+
+
+if __name__ == "__main__":
+    main()

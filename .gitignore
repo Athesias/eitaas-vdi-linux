@@ -1,0 +1,4 @@
+# Connection profiles are personal: never commit them.
+*.rdpw
+*.rdp
+__pycache__/

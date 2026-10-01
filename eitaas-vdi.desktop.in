@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Name=EITaaS VDI
+GenericName=Air Force virtual desktop
+Comment=Connect to the EITaaS Azure Virtual Desktop with CAC passthrough
+Exec=@BIN@ connect
+Icon=preferences-desktop-remote-desktop
+Categories=Network;RemoteAccess;
+Keywords=avd;rdp;cac;air force;vdi;windows;
+StartupNotify=false
+Actions=setup;doctor;signout;
+
+[Desktop Action setup]
+Name=Import profile from web client
+Exec=@BIN@ setup
+
+[Desktop Action doctor]
+Name=Check CAC and setup
+Exec=@BIN@ doctor --dialog
+
+[Desktop Action signout]
+Name=Forget browser sign-in
+Exec=@BIN@ signout

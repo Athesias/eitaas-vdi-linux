@@ -186,8 +186,8 @@ Only Azure US Government AVD profiles are accepted (gateway in `*.wvd.azure.us`)
 2. Open **EITaaS VDI** from your application launcher.
 3. A notification says *Connecting…*. A small **Sign in to your account** window opens.
 4. If prompted, pick your **PIV Authentication** certificate and enter your **PIN** in the *Unlock Security Device* prompt.
-5. The sign-in window closes on its own. **A second sign-in step follows automatically.** It may flash briefly and needs no input.
-6. The desktop window opens. It may take 30–60 seconds, or a few minutes if your session host has to start.
+5. The window changes to **Signed in. Connecting to your desktop…**. A second sign-in step follows in the same window automatically. You enter your PIN **only once** per connection.
+6. The desktop window opens and the sign-in window closes by itself. This may take 30–60 seconds, or a few minutes if your session host has to start.
 7. Once the session is up, the desktop resizes to fill the window. On Hyprland the window flickers once while this happens.
 
 If something is missing (no reader, no card, no profile), a popup tells you what to do instead.
@@ -259,6 +259,7 @@ Or use **EITaaS VDI → Check CAC and setup** in the launcher's right-click/acti
 | Notification: *Sign-in was cancelled or did not finish* | Sign-in window closed, timed out after 5 minutes, or Microsoft returned an error | Connect again; if it repeats, check the log for an `AADSTS…` code |
 | Notification mentions `AADSTS…` | Microsoft sign-in refused the request | Note the code and report it (section 11); `AADSTS50011`/`AADSTS700016` suggest the Government endpoints changed |
 | Popup: *certificate name mismatch / host key* from FreeRDP | A gateway is using a certificate the launcher didn't pre-verify | **Don't accept blindly.** Cancel and report the hostname shown (section 11). |
+| Asked for your PIN twice in one connection | The sign-in window was closed between the two sign-in steps | Leave the sign-in window open until the desktop appears |
 | Notification: *error retrieving ARM configuration* | Gateway timed out while starting your session host | Wait a minute and connect again |
 | Desktop is a small box (≈1024×768) in a big window | Resize happened before the session was ready | Resize the window once. On Hyprland press **Super+T** twice (float/unfloat). |
 | Linux shortcuts (Super+…) don't work in the VDI | Keyboard grab | **Right Shift + G** to release |

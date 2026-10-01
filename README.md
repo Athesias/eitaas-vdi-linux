@@ -48,7 +48,8 @@ Then open **EITaaS VDI** from your application launcher. The first launch walks 
 ```
 
 - **Azure US Government endpoints.** FreeRDP defaults to the commercial cloud. The launcher points it at `login.microsoftonline.us` with the `www.wvd.azure.us` scope.
-- **Separate sign-in browser profile.** The sign-in browser uses its own profile (`~/.local/share/eitaas-vdi/signin-browser`), so it never touches your everyday browser. Microsoft's session cookie lives there, so the second sign-in FreeRDP asks for finishes without input. `eitaas-vdi signout` deletes it.
+- **One sign-in window, one PIN.** FreeRDP asks for two tokens (the gateway, then the session host). Both run in the same sign-in window, which keeps your CAC unlocked and the Microsoft session alive, so you enter your PIN once. The window shows a "connecting" page in between and closes once Windows logs you on.
+- **Separate sign-in browser profile.** The sign-in browser uses its own profile (`~/.local/share/eitaas-vdi/signin-browser`), so it never touches your everyday browser. `eitaas-vdi signout` deletes it.
 - **Profile import.** `.rdpw` files are checked on import (must be an ARM/AVD profile with a `*.wvd.azure.us` gateway) and stored with mode `0600`.
 - **Log.** `~/.local/state/eitaas-vdi/last.log` has authorization codes, tokens and your logon identity (domain\user, DoD ID number) redacted.
 

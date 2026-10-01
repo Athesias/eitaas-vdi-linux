@@ -13,6 +13,7 @@ the OAuth redirect is captured over Chrome's private DevTools pipe and fed back 
   eitaas-vdi signout        forget the sign-in browser's cookies
 """
 
+import collections
 import concurrent.futures
 import fcntl
 import hashlib
@@ -203,7 +204,7 @@ class Browser:
     """A dedicated Chrome instance driven over --remote-debugging-pipe (fd 3 in, fd 4 out).
 
     The pipe is private to this process, unlike a TCP debugging port. The separate profile keeps
-    Microsoft's sign-in cookies, so the second token FreeRDP requests completes without input.
+    Microsoft's sign-in cookies away from the user's everyday browser.
     """
 
     def __init__(self, url, app=True):
@@ -229,37 +230,85 @@ class Browser:
         os.close(evt_w)
         self.buffer = b""
         self.next_id = 1
+        self.pending = collections.deque()
+        self.eof = False
+        self.page = None
+        self.session = None
         self.send("Target.setDiscoverTargets", {"discover": True})
 
-    def send(self, method, params=None):
+    def alive(self):
+        return not self.eof and self.proc.poll() is None
+
+    def send(self, method, params=None, session=None):
         message = {"id": self.next_id, "method": method, "params": params or {}}
+        if session:
+            message["sessionId"] = session
         self.next_id += 1
         try:
             os.write(self.cmd_w, json.dumps(message).encode() + b"\0")
         except OSError:
             pass
+        return message["id"]
+
+    def _read(self, timeout):
+        """Queue the messages Chrome sends within timeout; False once the pipe has closed."""
+        ready, _, _ = select.select([self.evt_r], [], [], timeout)
+        if not ready:
+            return True
+        chunk = os.read(self.evt_r, 65536)
+        if not chunk:
+            self.eof = True
+            return False
+        self.buffer += chunk
+        *messages, self.buffer = self.buffer.split(b"\0")
+        for raw in messages:
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                continue
+            target = message.get("params", {}).get("targetInfo", {})
+            if target.get("type") == "page" and not self.page:
+                self.page = target.get("targetId")
+            self.pending.append(message)
+        return True
+
+    def call(self, method, params=None, session=None, timeout=10):
+        """Send a command and return its result, keeping events for urls()."""
+        wanted = self.send(method, params, session)
+        deadline = time.monotonic() + timeout
+        while (remaining := deadline - time.monotonic()) > 0:
+            for message in list(self.pending):
+                if message.get("id") == wanted:
+                    self.pending.remove(message)
+                    return message.get("result")
+            if not self._read(min(remaining, 0.5)):
+                return None
+        return None
+
+    def navigate(self, url):
+        """Load url in the existing sign-in window."""
+        if not self.session:
+            deadline = time.monotonic() + 10
+            while not self.page and time.monotonic() < deadline and self._read(0.5):
+                pass
+            result = self.call("Target.attachToTarget", {"targetId": self.page, "flatten": True})
+            self.session = (result or {}).get("sessionId")
+        if self.session:
+            self.call("Page.navigate", {"url": url}, session=self.session)
 
     def urls(self, timeout):
         """Yield page URLs as Chrome navigates; returns when Chrome exits or the timeout passes."""
         deadline = time.monotonic() + timeout
-        while (remaining := deadline - time.monotonic()) > 0:
-            ready, _, _ = select.select([self.evt_r], [], [], min(remaining, 1.0))
-            if not ready:
-                continue
-            chunk = os.read(self.evt_r, 65536)
-            if not chunk:
-                return
-            self.buffer += chunk
-            *messages, self.buffer = self.buffer.split(b"\0")
-            for raw in messages:
-                try:
-                    event = json.loads(raw)
-                except ValueError:
-                    continue
+        while True:
+            while self.pending:
+                event = self.pending.popleft()
                 target = event.get("params", {}).get("targetInfo", {})
                 if event.get("method") in ("Target.targetCreated", "Target.targetInfoChanged") \
                         and target.get("type") == "page" and target.get("url"):
                     yield target["url"]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._read(min(remaining, 1.0)):
+                return
 
     def close(self):
         self.send("Browser.close")
@@ -284,16 +333,52 @@ def is_redirect(url):
     return "code" in query or "error" in query
 
 
-def browser_sign_in(auth_url):
-    """Open the authorization URL in the sign-in browser and return the redirect URL, or None."""
-    browser = Browser(auth_url)
-    try:
-        for url in browser.urls(SIGNIN_TIMEOUT):
-            if is_redirect(url):
+WAITING_PAGE = "data:text/html;charset=utf-8," + urllib.parse.quote(
+    "<!doctype html><title>EITaaS VDI</title><meta name=color-scheme content='light dark'>"
+    "<body style='font:16px system-ui,sans-serif;display:grid;place-items:center;height:90vh;margin:0'>"
+    "<div style='text-align:center'><p style='font-size:20px'>Signed in. Connecting to your desktop&hellip;</p>"
+    "<p style='opacity:.7'>This window closes by itself.</p></div>"
+)
+
+
+class SignIn:
+    """Sign-ins for one connection, all in one sign-in window.
+
+    FreeRDP asks for two tokens (the AVD gateway, then the session host). Running both in the
+    same browser keeps the CAC unlocked and the Microsoft session alive, so the PIN is asked once.
+    """
+
+    def __init__(self):
+        self.browser = None
+        self.used = set()
+
+    def __call__(self, auth_url):
+        """Return the redirect URL for auth_url, or None if the user cancelled or it timed out."""
+        if self.browser and self.browser.alive():
+            self.browser.navigate(auth_url)
+        else:
+            self.close()
+            self.browser = Browser(auth_url)
+        for url in self.browser.urls(SIGNIN_TIMEOUT):
+            if is_redirect(url) and url not in self.used:
+                self.used.add(url)
+                self.browser.navigate(WAITING_PAGE)
                 return url
         return None
+
+    def close(self):
+        if self.browser:
+            self.browser.close()
+            self.browser = None
+
+
+def browser_sign_in(auth_url):
+    """Open the authorization URL in its own sign-in browser and return the redirect URL, or None."""
+    sign_in = SignIn()
+    try:
+        return sign_in(auth_url)
     finally:
-        browser.close()
+        sign_in.close()
 
 
 # ---------------------------------------------------------------- gateway certificates
@@ -557,6 +642,7 @@ def connect():
     tail = []
     cancelled = False
     user_disconnect = False
+    sign_in = SignIn()
     notify("Connecting… sign in with your CAC if the browser asks.")
 
     buffer = b""
@@ -579,7 +665,7 @@ def connect():
                     cancelled = True
                     proc.terminate()
                     continue
-                redirect = browser_sign_in(auth_url)
+                redirect = sign_in(auth_url)
                 if not redirect or "code=" not in redirect:
                     log.write("sign-in cancelled or failed in the browser\n")
                     cancelled = True
@@ -593,6 +679,9 @@ def connect():
                     log.write("FreeRDP exited during sign-in\n")
             elif line.startswith("Paste redirect URL here"):
                 continue
+            elif "Logon Info" in line and sign_in.browser:
+                sign_in.close()  # logged on to Windows; no more sign-ins expected
+                log.write(redact(line) + "\n")
             elif "pressed, disconnecting RDP session" in line:
                 # The disconnect hotkey (Right Shift+D); FreeRDP then exits 131 like a failure.
                 user_disconnect = True
@@ -606,6 +695,7 @@ def connect():
                 if "[ERROR]" in clean and not NOISE.search(clean):
                     tail = (tail + [clean])[-10:]
         log.flush()
+    sign_in.close()
     code = proc.wait()
     os.close(master)
     session_profile.unlink(missing_ok=True)

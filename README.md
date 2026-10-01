@@ -51,6 +51,7 @@ Then open **EITaaS VDI** from your application launcher. The first launch walks 
 - **One sign-in window, one PIN.** FreeRDP asks for two tokens (the gateway, then the session host). Both run in the same sign-in window, which keeps your CAC unlocked and the Microsoft session alive, so you enter your PIN once. The window shows a "connecting" page in between and closes once Windows logs you on.
 - **Separate sign-in browser profile.** The sign-in browser uses its own profile (`~/.local/share/eitaas-vdi/signin-browser`), so it never touches your everyday browser. `eitaas-vdi signout` deletes it.
 - **Profile import.** `.rdpw` files are checked on import (must be an ARM/AVD profile with a `*.wvd.azure.us` gateway) and stored with mode `0600`.
+- **Fullscreen on Hyprland.** The desktop opens fullscreen on the monitor you launched from, at that monitor's resolution. Put `start = windowed` in `~/.config/eitaas-vdi/settings` to get a window instead.
 - **Log.** `~/.local/state/eitaas-vdi/last.log` has authorization codes, tokens and your logon identity (domain\user, DoD ID number) redacted.
 
 ### FreeRDP issues it works around
@@ -61,8 +62,9 @@ These are real FreeRDP 3.30–3.32 behaviors that otherwise break AVD on Linux:
 |---|---|
 | FreeRDP's hostname check rejects wildcard certificates (`*.wvd.azure.us`): its URL regex has no `*`. Every AVD gateway then shows a scary "certificate name mismatch" prompt. | Verifies the gateway certificates itself with Python's `ssl` (system CA store plus a correct hostname check) and pins the verified SHA-256 fingerprints with `/cert:fingerprint:…`. Nothing is ever blindly trusted. |
 | Web-client profiles set both `smart sizing` and `dynamic resolution`. FreeRDP refuses that combination (exit 22). | Runs FreeRDP on a private per-session copy (`$XDG_RUNTIME_DIR/eitaas-vdi/session.rdpw`) with smart sizing off. |
-| Profiles set `use multimon` + `singlemoninwindowedmode`. FreeRDP ignores the latter and fails with 64×64 "monitors" (exit 136). | In windowed mode the session copy uses one monitor, unless you ask for fullscreen/multi-monitor in `freerdp-args`. |
-| FreeRDP never sends the window's size when the resize channel comes up, so a window a tiling WM resized at startup stays a 1024×768 box. | On Hyprland, re-tiles the window once at that moment so the real size is sent. Other desktops: resize the window once. |
+| Profiles set `use multimon` + `singlemoninwindowedmode`. FreeRDP ignores the latter and fails with 64×64 "monitors" (exit 136). | The session copy uses one monitor, unless you ask for multi-monitor in `freerdp-args`. |
+| On Wayland, FreeRDP's SDL3 client measures monitors from its not-yet-sized window (64×64), so its own fullscreen (`/f`) and `/multimon` fail the pre-connect check. | On Hyprland the session is sized to the focused monitor (`/size:`) and Hyprland fullscreens the window when it appears. Windows starts at the right resolution. |
+| FreeRDP never sends the window's size when the resize channel comes up, so a window a tiling WM resized at startup stays a 1024×768 box. | Windowed mode on Hyprland: re-tiles the window once at that moment so the real size is sent. Other desktops: resize the window once. |
 | The Right Shift+D disconnect exits with the same code as a failed connection (131). | Recognizes the hotkey in the log and doesn't report an error. |
 
 ## Files

@@ -188,7 +188,7 @@ Only Azure US Government AVD profiles are accepted (gateway in `*.wvd.azure.us`)
 4. If prompted, pick your **PIV Authentication** certificate and enter your **PIN** in the *Unlock Security Device* prompt.
 5. The window changes to **Signed in. Connecting to your desktop…**. A second sign-in step follows in the same window automatically. You enter your PIN **only once** per connection.
 6. The desktop window opens and the sign-in window closes by itself. This may take 30–60 seconds, or a few minutes if your session host has to start.
-7. Once the session is up, the desktop resizes to fill the window. On Hyprland the window flickers once while this happens.
+7. **On Hyprland** the desktop opens **fullscreen on the monitor you launched it from**, at that monitor's resolution. **On other desktops** it opens in a window; if the desktop is a small box inside the window, resize the window once.
 
 If something is missing (no reader, no card, no profile), a popup tells you what to do instead.
 
@@ -215,18 +215,17 @@ Your card reader appears inside the Windows session as a smart card reader. Wind
 
 Copy/paste of text between Linux and the VDI, sound, and microphone are on by default.
 
-### Window size and monitors
+### Fullscreen, window size and monitors
 
-- The desktop follows the window size: resize, tile or fullscreen the window and Windows adjusts.
-- By default the session uses **one monitor** in a window.
-- For **fullscreen across all monitors**, create `~/.config/eitaas-vdi/freerdp-args` with:
+- **On Hyprland the VDI starts fullscreen** on the monitor that had focus when you launched it.
+- **To leave fullscreen**, first release the keyboard with **Right Shift + G**, then use your normal fullscreen key (Omarchy: **Super + F**). The window then tiles like any other, and Windows resizes to match. Press **Right Shift + G** again to give the keyboard back to Windows.
+- **To always start in a window**, create `~/.config/eitaas-vdi/settings` containing:
 
   ```
-  /f
-  /multimon
+  start = windowed
   ```
 
-  Multi-monitor is less tested; if displays look wrong, delete the file to go back to a window.
+- The session uses **one monitor**. Spanning several monitors (`/multimon`) and FreeRDP's own fullscreen (`/f`) currently fail on Wayland because of a FreeRDP bug (it measures the screen as 64×64). Don't put them in `freerdp-args` on a Wayland desktop.
 
 ## 9. Procedure F: Ending a session
 
@@ -261,7 +260,7 @@ Or use **EITaaS VDI → Check CAC and setup** in the launcher's right-click/acti
 | Popup: *certificate name mismatch / host key* from FreeRDP | A gateway is using a certificate the launcher didn't pre-verify | **Don't accept blindly.** Cancel and report the hostname shown (section 11). |
 | Asked for your PIN twice in one connection | The sign-in window was closed between the two sign-in steps | Leave the sign-in window open until the desktop appears |
 | Notification: *error retrieving ARM configuration* | Gateway timed out while starting your session host | Wait a minute and connect again |
-| Desktop is a small box (≈1024×768) in a big window | Resize happened before the session was ready | Resize the window once. On Hyprland press **Super+T** twice (float/unfloat). |
+| Desktop is a small box (≈1024×768) in a big window | Windowed mode, or a desktop other than Hyprland: the window was resized before the session was ready | Resize the window once. On Hyprland press **Super+T** twice (float/unfloat), or fullscreen it. |
 | Linux shortcuts (Super+…) don't work in the VDI | Keyboard grab | **Right Shift + G** to release |
 | CAC not seen inside Windows | Card pulled, or reader re-plugged mid-session | Re-insert, then disconnect (Right Shift + D) and reconnect |
 | Popup: *A connection is already starting or running* | Another launcher instance is open | Use the open window, or end it (section 9) |
@@ -338,6 +337,7 @@ Your profile and settings are kept.
 
 | Setting | Purpose |
 |---|---|
-| `~/.config/eitaas-vdi/freerdp-args` | Extra FreeRDP options, one per line (e.g. `/f`, `/multimon`); lines starting with `#` are ignored |
+| `~/.config/eitaas-vdi/settings` | `start = fullscreen` (default on Hyprland) or `start = windowed` |
+| `~/.config/eitaas-vdi/freerdp-args` | Extra FreeRDP options, one per line; lines starting with `#` are ignored |
 | `EITAAS_VDI_BROWSER=chromium` | Use a specific browser command for sign-in |
 | `EITAAS_VDI_FREERDP=/path/to/sdl-freerdp3` | Use a specific FreeRDP build |

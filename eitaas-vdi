@@ -41,6 +41,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP
 PROFILE = CONFIG_DIR / "profile.rdpw"
 EXTRA_ARGS = CONFIG_DIR / "freerdp-args"
+SETTINGS = CONFIG_DIR / "settings"
 BROWSER_PROFILE = DATA_DIR / "signin-browser"
 LOG = STATE_DIR / "last.log"
 
@@ -502,6 +503,17 @@ def setup(argv, first_run=False):
 # ---------------------------------------------------------------- connect
 
 
+def settings():
+    """key = value lines from ~/.config/eitaas-vdi/settings. start = fullscreen | windowed."""
+    values = {"start": "fullscreen"}
+    if SETTINGS.is_file():
+        for line in SETTINGS.read_text().splitlines():
+            key, sep, value = line.partition("=")
+            if sep and not key.lstrip().startswith("#"):
+                values[key.strip().lower()] = value.strip().lower()
+    return values
+
+
 def extra_args():
     if not EXTRA_ARGS.is_file():
         return []
@@ -538,7 +550,7 @@ def runtime_profile():
     return path
 
 
-def freerdp_command(profile, pins=""):
+def freerdp_command(profile, pins="", size=None):
     command = [
         FREERDP,
         str(profile),
@@ -558,6 +570,8 @@ def freerdp_command(profile, pins=""):
     ]
     if pins:
         command.append(f"/cert:{pins}")
+    if size:
+        command.append(f"/size:{size[0]}x{size[1]}")
     return command + extra_args()
 
 
@@ -584,6 +598,45 @@ def hypr_window(pid):
         return next((c for c in json.loads(out) if c.get("pid") == pid), None)
     except ValueError:
         return None
+
+
+def hyprland():
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and shutil.which("hyprctl")
+
+
+def focused_monitor_size():
+    """Logical size of the focused Hyprland monitor, or None."""
+    if not hyprland():
+        return None
+    out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, check=False).stdout
+    try:
+        monitor = next(m for m in json.loads(out) if m.get("focused"))
+    except (ValueError, StopIteration):
+        return None
+    scale = monitor.get("scale") or 1
+    width, height = round(monitor["width"] / scale), round(monitor["height"] / scale)
+    if monitor.get("transform", 0) % 2:  # rotated 90/270
+        width, height = height, width
+    return width, height
+
+
+def fullscreen_when_mapped(proc):
+    """Fullscreen FreeRDP's window with Hyprland as soon as it appears.
+
+    FreeRDP's own /f is unusable on Wayland: its SDL3 client measures the monitor from its
+    not-yet-configured window (64x64) and fails the pre-connect check. Instead the session is
+    sized to the monitor with /size and the compositor fullscreens the window. The window only
+    appears once sign-in has finished, so this waits for as long as FreeRDP runs.
+    """
+    while proc.poll() is None:
+        window = hypr_window(proc.pid)
+        if window and window.get("mapped", True):
+            if not window.get("fullscreen"):
+                command = ('hl.dsp.window.fullscreen({ mode = "fullscreen", action = "set", '
+                           f'window = "address:{window["address"]}" }})')
+                subprocess.run(["hyprctl", "dispatch", command], capture_output=True, check=False)
+            return
+        time.sleep(0.2)
 
 
 def nudge_window(pid):
@@ -632,16 +685,21 @@ def connect():
     # FreeRDP's sign-in prompt is printf() without fflush(); a pty keeps stdout line-buffered.
     # stdin stays a pipe so the long redirect URL is not bounded by the tty line limit.
     session_profile = runtime_profile()
-    command = freerdp_command(session_profile, pinned_certificates())
+    fullscreen = settings()["start"] != "windowed" and hyprland()
+    size = focused_monitor_size() if fullscreen else None
+    command = freerdp_command(session_profile, pinned_certificates(), size)
     master, slave = pty.openpty()
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=slave, stderr=slave)
     os.close(slave)
+    if size:
+        threading.Thread(target=fullscreen_when_mapped, args=(proc,), daemon=True).start()
     log_fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     log = os.fdopen(log_fd, "w")
     log.write(f"# {time.strftime('%F %T')} {redact(' '.join(command))}\n")
     tail = []
     cancelled = False
     user_disconnect = False
+    nudged = False
     sign_in = SignIn()
     notify("Connecting… sign in with your CAC if the browser asks.")
 
@@ -687,8 +745,11 @@ def connect():
                 user_disconnect = True
                 log.write(redact(line) + "\n")
             elif "DisplayControlCapsPdu: setting the window as resizable" in line:
-                log.write("display control ready; resizing to the window\n")
-                threading.Thread(target=nudge_window, args=(proc.pid,), daemon=True).start()
+                # Windows can announce this more than once; two overlapping nudges leave it floating.
+                if not nudged:
+                    nudged = True
+                    log.write("display control ready; resizing to the window\n")
+                    threading.Thread(target=nudge_window, args=(proc.pid,), daemon=True).start()
             else:
                 clean = redact(line)
                 log.write(clean + "\n")

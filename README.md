@@ -52,6 +52,7 @@ Then open **EITaaS VDI** from your application launcher. The first launch walks 
 - **Separate sign-in browser profile.** The sign-in browser uses its own profile (`~/.local/share/eitaas-vdi/signin-browser`), so it never touches your everyday browser. `eitaas-vdi signout` deletes it.
 - **Profile import.** `.rdpw` files are checked on import (must be an ARM/AVD profile with a `*.wvd.azure.us` gateway) and stored with mode `0600`.
 - **Fullscreen on Hyprland.** The desktop opens fullscreen on the monitor you launched from, at that monitor's resolution. Put `start = windowed` in `~/.config/eitaas-vdi/settings` to get a window instead.
+- **Follows your Omarchy theme.** On Omarchy, the popups and the sign-in window's "connecting" page use the colors of your current theme (Omarchy itself colors the sign-in browser's frame, the notifications and the window border). On other desktops they keep their stock look. Put `theme = default` in `~/.config/eitaas-vdi/settings` to opt out.
 - **Log.** `~/.local/state/eitaas-vdi/last.log` has authorization codes, tokens and your logon identity (domain\user, DoD ID number) redacted.
 
 ### FreeRDP issues it works around

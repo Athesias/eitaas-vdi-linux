@@ -337,7 +337,7 @@ Your profile and settings are kept.
 
 | Setting | Purpose |
 |---|---|
-| `~/.config/eitaas-vdi/settings` | `start = fullscreen` (default on Hyprland) or `start = windowed` |
+| `~/.config/eitaas-vdi/settings` | `start = fullscreen` (default on Hyprland) or `start = windowed`; on Omarchy, `theme = default` stops the popups following your Omarchy theme |
 | `~/.config/eitaas-vdi/freerdp-args` | Extra FreeRDP options, one per line; lines starting with `#` are ignored |
 | `EITAAS_VDI_BROWSER=chromium` | Use a specific browser command for sign-in |
 | `EITAAS_VDI_FREERDP=/path/to/sdl-freerdp3` | Use a specific FreeRDP build |
